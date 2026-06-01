@@ -97,6 +97,7 @@ class QEffWanPipeline:
         use_unified: bool = True,
         enable_first_block_cache: bool = False,
         first_block_cache_downsample_factor: int = 4,
+        share_transformer_devices: bool = False,
         **kwargs,
     ):
         """
@@ -116,6 +117,11 @@ class QEffWanPipeline:
                 Supported only for non-unified mode.
             first_block_cache_downsample_factor (int): Downsample factor for the first-block
                 residual cache key. Used only when first-block-cache is enabled.
+            share_transformer_devices (bool): If True (non-unified mode only), transformer_high
+                and transformer_low share the same physical devices sequentially. transformer_high
+                is loaded first; after all high-noise steps complete it is unloaded and
+                transformer_low is loaded on the same devices. Enables running the 720P model
+                on 24 devices (16 shared + 8 VAE) instead of 40. Default: False.
             **kwargs: Additional keyword arguments including configuration parameters
         """
         # Store original model and configuration
@@ -123,11 +129,17 @@ class QEffWanPipeline:
         self.use_unified = use_unified
         self.enable_first_block_cache = enable_first_block_cache
         self.first_block_cache_downsample_factor = first_block_cache_downsample_factor
+        self.share_transformer_devices = share_transformer_devices
         self.kwargs = kwargs
         self.custom_config = None
 
         if self.enable_first_block_cache and self.use_unified:
             raise ValueError("First-block-cache is currently supported only for non-unified WAN (`use_unified=False`).")
+
+        if self.share_transformer_devices and self.use_unified:
+            raise ValueError(
+                "`share_transformer_devices=True` is only supported for non-unified WAN (`use_unified=False`)."
+            )
 
         # Text encoder (TODO: Replace with QEfficient UMT5 optimization)
         self.text_encoder = model.text_encoder
@@ -206,6 +218,7 @@ class QEffWanPipeline:
         use_unified: bool = True,
         enable_first_block_cache: bool = False,
         first_block_cache_downsample_factor: int = 4,
+        share_transformer_devices: bool = False,
         **kwargs,
     ):
         """
@@ -226,6 +239,9 @@ class QEffWanPipeline:
                 for non-unified mode.
             first_block_cache_downsample_factor (int, optional): Downsample factor for first-block
                 cache key when cache is enabled.
+            share_transformer_devices (bool, optional): If True (non-unified mode only),
+                transformer_high and transformer_low share the same physical devices sequentially,
+                enabling 720P inference on 24 devices instead of 40. Default: False.
             **kwargs: Additional keyword arguments passed to WanPipeline.from_pretrained().
 
         Returns:
@@ -244,10 +260,11 @@ class QEffWanPipeline:
             >>> # Load from local path
             >>> pipeline = QEffWanPipeline.from_pretrained("/local/path/to/wan")
             >>>
-            >>> # Load with custom cache directory
+            >>> # 720P with device sharing (24 devices: 16 shared + 8 VAE)
             >>> pipeline = QEffWanPipeline.from_pretrained(
-            ...     "wan-model-id",
-            ...     cache_dir="/custom/cache/dir"
+            ...     "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            ...     use_unified=False,
+            ...     share_transformer_devices=True,
             ... )
         """
         # Load the base WAN model in float32 on CPU for optimization
@@ -262,6 +279,7 @@ class QEffWanPipeline:
             use_unified=use_unified,
             enable_first_block_cache=enable_first_block_cache,
             first_block_cache_downsample_factor=first_block_cache_downsample_factor,
+            share_transformer_devices=share_transformer_devices,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             **kwargs,
         )
@@ -477,6 +495,27 @@ class QEffWanPipeline:
     def _prepare_transformer_sessions(self, batch_size: int, cl: int) -> None:
         if self.use_unified:
             self._setup_transformer_session(self.transformer, batch_size, cl)
+        elif self.share_transformer_devices:
+            # Device-sharing mode: transformer_high and transformer_low share the same
+            # physical devices sequentially.  Only load and activate transformer_high here;
+            # transformer_low will be loaded lazily in the denoise loop after all high-noise
+            # steps are complete (transformer_low.qpc_session stays None until then).
+            #
+            # Re-entrant handling for multiple __call__ invocations:
+            #   - If transformer_low is still active from a previous run, deactivate it first
+            #     so the devices are free for transformer_high.
+            #   - If transformer_high was deactivated at the end of a previous run, re-activate it.
+            if self.transformer_low.qpc_session is not None and self.transformer_low.qpc_session.is_active:
+                self.transformer_low.qpc_session.deactivate()
+            if self.transformer_high.qpc_session is None:
+                self.transformer_high.qpc_session = QAICInferenceSession(
+                    str(self.transformer_high.qpc_path), device_ids=self.transformer_high.device_ids
+                )
+            elif not self.transformer_high.qpc_session.is_active:
+                self.transformer_high.qpc_session.activate()
+            self.transformer_high.qpc_session.set_buffers(
+                {"output": np.random.rand(batch_size, cl, constants.WAN_DIT_OUT_CHANNELS).astype(np.int32)}
+            )
         else:
             self._setup_transformer_session(self.transformer_high, batch_size, cl)
             self._setup_transformer_session(self.transformer_low, batch_size, cl)
@@ -666,6 +705,29 @@ class QEffWanPipeline:
                     current_transformer_module = self.transformer_low
                     current_guidance_scale = guidance_scale_2
                 current_model = current_transformer_module.model
+
+                # Device-sharing: all high-noise steps are now complete.
+                # Unload transformer_high from the devices, then load transformer_low
+                # on the same devices. Fires exactly once per inference run when
+                # share_transformer_devices=True (transformer_low.qpc_session is None
+                # only before its first use in that mode).
+                if (
+                    self.share_transformer_devices
+                    and current_transformer_module is self.transformer_low
+                    and current_transformer_module.qpc_session is None
+                ):
+                    _, _, latent_frames, latent_height, latent_width = latents.shape
+                    p_t, p_h, p_w = current_model.config.patch_size
+                    _cl = (latent_frames // p_t) * (latent_height // p_h) * (latent_width // p_w)
+                    logger.info("All high-noise steps done. Unloading transformer_high from devices.")
+                    self.transformer_high.qpc_session.deactivate()
+                    logger.info("Loading transformer_low on the same devices.")
+                    self.transformer_low.qpc_session = QAICInferenceSession(
+                        str(self.transformer_low.qpc_path), device_ids=self.transformer_low.device_ids
+                    )
+                    self.transformer_low.qpc_session.set_buffers(
+                        {"output": np.random.rand(batch_size, _cl, constants.WAN_DIT_OUT_CHANNELS).astype(np.int32)}
+                    )
 
                 latent_model_input = latents.to(transformer_dtype)
                 if self.model.config.expand_timesteps:
@@ -1052,3 +1114,4 @@ class QEffWanPipeline:
             pipeline_module=perf_metrics,
             images=video,
         )
+ 

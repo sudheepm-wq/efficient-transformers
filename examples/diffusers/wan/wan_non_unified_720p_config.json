@@ -1,0 +1,73 @@
+{
+  "description": "WAN 720P non-unified config with device sharing (24 devices total). transformer_high and transformer_low share the same 16 devices sequentially: transformer_high runs first (high-noise steps), then is unloaded, and transformer_low is loaded on the same devices (low-noise steps). vae_decoder uses 8 separate devices.",
+  "modules": {
+    "transformer_high": {
+      "specializations": {
+        "batch_size": "1",
+        "num_channels": "16",
+        "steps": "1",
+        "sequence_length": "512"
+      },
+      "compilation": {
+        "onnx_path": null,
+        "compile_dir": null,
+        "mdp_ts_num_devices": 16,
+        "mxfp6_matmul": true,
+        "convert_to_fp16": true,
+        "compile_only": true,
+        "aic_num_cores": 16,
+        "mos": 1,
+        "mdts_mos": 1
+      },
+      "execute": {
+        "device_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "qpc_path": null
+      }
+    },
+    "transformer_low": {
+      "specializations": {
+        "batch_size": "1",
+        "num_channels": "16",
+        "steps": "1",
+        "sequence_length": "512"
+      },
+      "compilation": {
+        "onnx_path": null,
+        "compile_dir": null,
+        "mdp_ts_num_devices": 16,
+        "mxfp6_matmul": true,
+        "convert_to_fp16": true,
+        "compile_only": true,
+        "aic_num_cores": 16,
+        "mos": 1,
+        "mdts_mos": 1
+      },
+      "execute": {
+        "device_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "qpc_path": null
+      }
+    },
+    "vae_decoder": {
+      "specializations": {
+        "batch_size": 1,
+        "num_channels": 16
+      },
+      "compilation": {
+        "onnx_path": null,
+        "compile_dir": null,
+        "mdp_ts_num_devices": 8,
+        "mxfp6_matmul": false,
+        "convert_to_fp16": true,
+        "aic_num_cores": 16,
+        "aic-enable-depth-first": true,
+        "compile_only": true,
+        "mos": 1,
+        "mdts_mos": 1
+      },
+      "execute": {
+        "device_ids": [16, 17, 18, 19, 20, 21, 22, 23],
+        "qpc_path": null
+      }
+    }
+  }
+}
