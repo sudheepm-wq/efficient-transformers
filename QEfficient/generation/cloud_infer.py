@@ -103,7 +103,7 @@ class QAICInferenceSession:
         self.binding_index_map = {binding.name: binding.index for binding in self.bindings}
         # Create and load Program
         prog_properties = qaicrt.QAicProgramProperties()
-        prog_properties.dataPathTimeoutMs = 60_000
+        prog_properties.dataPathTimeoutMs = 72_00_000
         if device_ids and len(device_ids) > 1:
             prog_properties.devMapping = ":".join(map(str, device_ids))
         self.program = qaicrt.Program(self.context, None, qpc, prog_properties)
@@ -139,6 +139,7 @@ class QAICInferenceSession:
         if self.is_active:
             del self.execObj
             self.program.deactivate()
+            self.program.unload()
             self.is_active = False
 
     def set_buffers(self, buffers: Dict[str, np.ndarray]):
